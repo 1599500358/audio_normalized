@@ -307,21 +307,21 @@ class AudioProcessProNode:
         audio_data = audio_data.T
         
         # 创建Pre-Chain处理链（ACE-Step Pro V2 - 稳定优先版）
-        pre_board = Pedalboard([
+        effects_list = [
             # 【第1步：清理低频】V2更保守
             # 高通滤波器 - 40Hz（V2: 保留更多低频，原版120Hz）
             HighpassFilter(cutoff_frequency_hz=40.0),
             
             # 低频搁架 - 200Hz -1dB（V2: 更温和，原版-2dB）
             LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-1.0),
-        ])
+        ]
         
         # 【可选：去嗡嗡声处理】V2新增功能
         if hum_removal != "None":
             hum_freq = 50.0 if hum_removal == "50Hz" else 60.0
             # 去除基频及谐波（60/120/180Hz或50/100/150Hz）
             for k in range(1, 4):  # 3个谐波
-                pre_board.append(
+                effects_list.append(
                     PeakFilter(
                         cutoff_frequency_hz=hum_freq * k,
                         gain_db=-12.0,
@@ -330,7 +330,7 @@ class AudioProcessProNode:
                 )
         
         # 【第2步：中频清晰度处理】V2简化版（5频段 vs 原版8频段）
-        pre_board.extend([
+        effects_list.extend([
             # 削减中低频泥泞（300Hz）V2: -2dB（原版-3dB）
             PeakFilter(cutoff_frequency_hz=300.0, gain_db=-2.0, q=0.9),
             
@@ -343,7 +343,7 @@ class AudioProcessProNode:
         ])
         
         # 【第3步：高频清亮处理】V2更温和
-        pre_board.extend([
+        effects_list.extend([
             # V2移除了5000Hz临场感提升（简化）
             
             # 高频搁架（10000Hz）V2: +1dB（原版8000Hz +2dB）
@@ -351,7 +351,7 @@ class AudioProcessProNode:
         ])
         
         # 【第4步：动态控制 - V2更温和的双压缩器】
-        pre_board.extend([
+        effects_list.extend([
             # 第一级：粗压缩（V2更温和）
             Compressor(
                 threshold_db=-22.0,
@@ -368,6 +368,9 @@ class AudioProcessProNode:
                 release_ms=120.0     # V2: 120ms（原版100ms）
             ),
         ])
+        
+        # 创建Pre-Chain Pedalboard
+        pre_board = Pedalboard(effects_list)
         
         # 应用Pre-Chain效果处理
         processed_audio = pre_board(audio_data, sample_rate)
