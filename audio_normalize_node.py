@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import torch
-from pedalboard import Pedalboard, Compressor, HighpassFilter, HighShelfFilter, LowShelfFilter, PeakFilter
+from pedalboard import Pedalboard, Compressor, HighpassFilter, HighShelfFilter, LowShelfFilter, PeakFilter, Limiter
 from pedalboard.io import AudioFile
 import pyloudnorm as pyln
 import folder_paths
@@ -166,7 +166,7 @@ class AudioProcessNode:
     
     def process_audio(self, audio, target_loudness=-14.0):
         """
-        处理音频：去浑浊、提亮、压缩、音量归一化（不保存文件）
+        处理音频：ACE-Step专业混音级处理 - 去浑浊、分离度、清晰度、音量归一化
         """
         # 获取音频数据
         waveform = audio["waveform"]  # shape: [batch, channels, samples]
@@ -181,21 +181,169 @@ class AudioProcessNode:
         # 转置为 [samples, channels] 格式（pedalboard需要）
         audio_data = audio_data.T
         
-        # 创建音频处理链
+        # 创建音频处理链（ACE-Step专业混音级处理）
         board = Pedalboard([
-            # 去浑浊：高通滤波器，去除低频浑浊声音
-            HighpassFilter(cutoff_frequency_hz=80.0),
+            # 【第1步：清理低频浑浊】
+            # 高通滤波器 - 切除120Hz以下低频，去除浑浊感
+            HighpassFilter(cutoff_frequency_hz=120.0),
             
-            # 提亮：高频增强
-            HighShelfFilter(cutoff_frequency_hz=4000.0, gain_db=2.0, q=0.7),
+            # 低频搁架 - 削减200Hz以下，去除boxiness（盒音）
+            LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-2.0),
             
-            # 轻压缩：防止爆音，让音量更均衡
+            # 【第2步：中频清晰度处理】⚠️ 解决"粘连感"的关键
+            # 削减中低频泥泞（300Hz）- 这是乐器糊在一起的主要原因
+            PeakFilter(cutoff_frequency_hz=300.0, gain_db=-3.0, q=1.0),
+            
+            # 提升中高频清晰度（2500Hz）- 让人声和主乐器更清晰
+            PeakFilter(cutoff_frequency_hz=2500.0, gain_db=2.5, q=1.5),
+            
+            # 【第3步：高频清亮处理】⚠️ 解决"沉闷"的关键
+            # 临场感提升（5000Hz）- 增加presence，让声音"在眼前"
+            PeakFilter(cutoff_frequency_hz=5000.0, gain_db=3.0, q=2.0),
+            
+            # 高频搁架（8000Hz）- 增加空气感和亮度
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.0),
+            
+            # 【第4步：动态控制】⚠️ 解决"乐器糊在一起"的关键
+            # 压缩器 - 让音量更均衡，乐器更分离
             Compressor(
-                threshold_db=-20.0,  # 压缩阈值
-                ratio=3.0,           # 压缩比 3:1 (轻压缩)
-                attack_ms=10.0,      # 快速启动
-                release_ms=100.0     # 平滑释放
+                threshold_db=-20.0,
+                ratio=3.0,
+                attack_ms=10.0,
+                release_ms=100.0
             ),
+            
+            # 【第5步：限幅保护】防止爆音
+            Limiter(threshold_db=-1.0),
+        ])
+        
+        # 应用效果处理
+        processed_audio = board(audio_data, sample_rate)
+        
+        # 音量归一化到目标LUFS
+        meter = pyln.Meter(sample_rate)
+        
+        # 测量当前响度
+        try:
+            loudness = meter.integrated_loudness(processed_audio)
+            # 归一化到目标响度
+            processed_audio = pyln.normalize.loudness(
+                processed_audio, 
+                loudness, 
+                target_loudness
+            )
+        except Exception as e:
+            print(f"警告：音量归一化失败 - {e}，使用峰值归一化")
+            # 如果LUFS归一化失败，使用峰值归一化
+            peak = np.abs(processed_audio).max()
+            if peak > 0:
+                processed_audio = processed_audio * (0.95 / peak)
+        
+        # 确保不超过[-1, 1]范围
+        processed_audio = np.clip(processed_audio, -1.0, 1.0)
+        
+        # 转换回PyTorch格式返回
+        processed_tensor = torch.from_numpy(processed_audio.T).unsqueeze(0)  # [1, channels, samples]
+        
+        output_audio = {
+            "waveform": processed_tensor,
+            "sample_rate": sample_rate
+        }
+        
+        return (output_audio,)
+
+
+class AudioProcessProNode:
+    """
+    ComfyUI音频处理节点 - Pro版（仅处理不保存）
+    功能：ACE-Step Pro级处理 - 更精细的EQ + 双压缩器串联
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "target_loudness": ("FLOAT", {
+                    "default": -14.0,
+                    "min": -30.0,
+                    "max": -5.0,
+                    "step": 0.5,
+                    "display": "number"
+                }),
+            },
+        }
+    
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "process_audio"
+    CATEGORY = "audio/processing"
+    
+    def process_audio(self, audio, target_loudness=-14.0):
+        """
+        处理音频：ACE-Step Pro专业混音级处理 - 8频段EQ + 双压缩器
+        """
+        # 获取音频数据
+        waveform = audio["waveform"]  # shape: [batch, channels, samples]
+        sample_rate = audio["sample_rate"]
+        
+        # 转换为numpy数组处理（取第一个batch）
+        if isinstance(waveform, torch.Tensor):
+            audio_data = waveform[0].cpu().numpy()  # [channels, samples]
+        else:
+            audio_data = waveform[0]
+        
+        # 转置为 [samples, channels] 格式（pedalboard需要）
+        audio_data = audio_data.T
+        
+        # 创建音频处理链（ACE-Step Pro专业混音级处理）
+        board = Pedalboard([
+            # 【第1步：清理低频浑浊】
+            # 高通滤波器 - 切除120Hz以下低频
+            HighpassFilter(cutoff_frequency_hz=120.0),
+            
+            # 低频搁架 - 削减200Hz以下
+            LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-2.0),
+            
+            # 【第2步：中频清晰度处理 - Pro版8频段】
+            # 削减中低频泥泞（300Hz）
+            PeakFilter(cutoff_frequency_hz=300.0, gain_db=-3.0, q=1.0),
+            
+            # ⭐ Pro新增：中频清理（600Hz）- 去除中频浑浊
+            PeakFilter(cutoff_frequency_hz=600.0, gain_db=-1.5, q=1.5),
+            
+            # 提升中高频清晰度（2500Hz）
+            PeakFilter(cutoff_frequency_hz=2500.0, gain_db=2.5, q=1.5),
+            
+            # ⭐ Pro新增：中高频细节（3500Hz）- 增强咬字和细节
+            PeakFilter(cutoff_frequency_hz=3500.0, gain_db=2.0, q=2.0),
+            
+            # 【第3步：高频清亮处理】
+            # 临场感提升（5000Hz）
+            PeakFilter(cutoff_frequency_hz=5000.0, gain_db=3.0, q=2.0),
+            
+            # 高频搁架（8000Hz）- 空气感
+            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.0),
+            
+            # 【第4步：动态控制 - Pro版双压缩器串联】⭐⭐⭐
+            # 第一级：粗压缩（处理大动态）
+            Compressor(
+                threshold_db=-22.0,  # 比标准版更激进
+                ratio=3.0,
+                attack_ms=10.0,
+                release_ms=100.0
+            ),
+            
+            # 第二级：精细压缩（平滑过渡）
+            Compressor(
+                threshold_db=-18.0,  # 只处理中高音量
+                ratio=2.0,           # 更温和的压缩
+                attack_ms=10.0,
+                release_ms=100.0
+            ),
+            
+            # 【第5步：限幅保护】防止爆音
+            Limiter(threshold_db=-1.0),
         ])
         
         # 应用效果处理
@@ -236,8 +384,8 @@ class AudioProcessNode:
 
 class VocalEnhanceNode:
     """
-    ComfyUI人声增强节点
-    功能：人声频段增强、去齿音、去低频噪音、压缩、音量归一化
+    ComfyUI人声增强节点 - Pro版
+    功能：专业人声处理 - 多频段EQ + 双压缩器 + 去齿音
     """
     
     @classmethod
@@ -245,13 +393,6 @@ class VocalEnhanceNode:
         return {
             "required": {
                 "audio": ("AUDIO",),
-                "target_loudness": ("FLOAT", {
-                    "default": -16.0,
-                    "min": -30.0,
-                    "max": -5.0,
-                    "step": 0.5,
-                    "display": "number"
-                }),
                 "de_esser_strength": ("FLOAT", {
                     "default": 3.0,
                     "min": 0.0,
@@ -267,9 +408,9 @@ class VocalEnhanceNode:
     FUNCTION = "enhance_vocal"
     CATEGORY = "audio/processing"
     
-    def enhance_vocal(self, audio, target_loudness=-16.0, de_esser_strength=3.0):
+    def enhance_vocal(self, audio, de_esser_strength=3.0):
         """
-        人声增强处理
+        人声专业增强处理（Pro版 - 不处理响度）
         """
         # 获取音频数据
         waveform = audio["waveform"]
@@ -282,47 +423,66 @@ class VocalEnhanceNode:
         
         audio_data = audio_data.T
         
-        # 人声处理链
+        # 人声处理链（Pro版 - 参考audio_enhancer_pro.py）
         board = Pedalboard([
+            # 【第1步：清理低频】人声专用
             # 去低频噪音和隆隆声（人声通常从100Hz开始）
             HighpassFilter(cutoff_frequency_hz=100.0),
             
-            # 温暖人声基频（200-500Hz）
-            PeakFilter(cutoff_frequency_hz=250.0, gain_db=2.0, q=1.0),
+            # 削减低频浑浊（200Hz以下）
+            LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-1.5),
             
-            # 增强人声清晰度（2-4kHz）
-            PeakFilter(cutoff_frequency_hz=3000.0, gain_db=3.0, q=1.5),
+            # 【第2步：中频处理 - 人声核心频段】⭐ Pro改进
+            # 削减中低频泥泞（250-350Hz）- 人声"盒音"区域
+            PeakFilter(cutoff_frequency_hz=300.0, gain_db=-2.5, q=1.2),
             
-            # 去齿音（降低6-8kHz的尖锐声）
-            PeakFilter(cutoff_frequency_hz=7000.0, gain_db=-de_esser_strength, q=2.0),
+            # ⭐ Pro新增：清理中频浑浊（500-700Hz）
+            PeakFilter(cutoff_frequency_hz=600.0, gain_db=-1.0, q=1.5),
+            
+            # 温暖人声基频（200-500Hz范围的上部）
+            PeakFilter(cutoff_frequency_hz=400.0, gain_db=1.5, q=1.0),
+            
+            # 【第3步：清晰度提升 - 人声临场感】⭐ Pro改进
+            # 增强人声清晰度（2-3kHz）- 人声主要能量区
+            PeakFilter(cutoff_frequency_hz=2500.0, gain_db=3.5, q=1.5),
+            
+            # ⭐ Pro新增：人声细节和咬字（3-4kHz）
+            PeakFilter(cutoff_frequency_hz=3500.0, gain_db=2.5, q=2.0),
+            
+            # 临场感提升（4-6kHz）- 让人声"在眼前"
+            PeakFilter(cutoff_frequency_hz=5000.0, gain_db=3.0, q=2.0),
+            
+            # 【第4步：去齿音 + 高频处理】
+            # 去齿音（降低6-8kHz的尖锐声）- 可调强度
+            PeakFilter(cutoff_frequency_hz=7000.0, gain_db=-de_esser_strength, q=2.5),
             
             # 轻微提亮高频（增加空气感）
             HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=1.5, q=0.7),
             
-            # 人声压缩（让音量更稳定）
+            # 【第5步：动态控制 - Pro版双压缩器】⭐⭐⭐
+            # 第一级：人声粗压缩（处理大动态）
             Compressor(
-                threshold_db=-18.0,
-                ratio=4.0,           # 较强压缩，让人声更稳定
-                attack_ms=5.0,       # 快速启动
-                release_ms=50.0      # 快速释放
+                threshold_db=-20.0,
+                ratio=4.0,           # 人声需要较强压缩
+                attack_ms=5.0,       # 快速启动，抓住瞬态
+                release_ms=50.0      # 快速释放，保持自然
             ),
+            
+            # 第二级：人声精细压缩（平滑音量）
+            Compressor(
+                threshold_db=-15.0,  # 只处理中高音量
+                ratio=2.5,           # 温和压缩
+                attack_ms=5.0,
+                release_ms=50.0
+            ),
+            
+            # 【第6步：限幅保护】
+            Limiter(threshold_db=-1.0),
         ])
         
         processed_audio = board(audio_data, sample_rate)
         
-        # 音量归一化
-        meter = pyln.Meter(sample_rate)
-        try:
-            loudness = meter.integrated_loudness(processed_audio)
-            processed_audio = pyln.normalize.loudness(
-                processed_audio, loudness, target_loudness
-            )
-        except Exception as e:
-            print(f"警告：音量归一化失败 - {e}")
-            peak = np.abs(processed_audio).max()
-            if peak > 0:
-                processed_audio = processed_audio * (0.95 / peak)
-        
+        # 不进行响度归一化，只做安全限幅
         processed_audio = np.clip(processed_audio, -1.0, 1.0)
         
         processed_tensor = torch.from_numpy(processed_audio.T).unsqueeze(0)
@@ -336,8 +496,8 @@ class VocalEnhanceNode:
 
 class InstrumentalEnhanceNode:
     """
-    ComfyUI伴奏增强节点
-    功能：低音增强、高频亮度、中频清晰、压缩、音量归一化
+    ComfyUI伴奏增强节点 - Pro版
+    功能：专业伴奏处理 - 多频段EQ + 双压缩器 + 可调低音/高音
     """
     
     @classmethod
@@ -345,13 +505,6 @@ class InstrumentalEnhanceNode:
         return {
             "required": {
                 "audio": ("AUDIO",),
-                "target_loudness": ("FLOAT", {
-                    "default": -14.0,
-                    "min": -30.0,
-                    "max": -5.0,
-                    "step": 0.5,
-                    "display": "number"
-                }),
                 "bass_boost": ("FLOAT", {
                     "default": 3.0,
                     "min": 0.0,
@@ -374,9 +527,9 @@ class InstrumentalEnhanceNode:
     FUNCTION = "enhance_instrumental"
     CATEGORY = "audio/processing"
     
-    def enhance_instrumental(self, audio, target_loudness=-14.0, bass_boost=3.0, treble_boost=2.0):
+    def enhance_instrumental(self, audio, bass_boost=3.0, treble_boost=2.0):
         """
-        伴奏增强处理
+        伴奏专业增强处理（Pro版 - 不处理响度）
         """
         # 获取音频数据
         waveform = audio["waveform"]
@@ -389,47 +542,64 @@ class InstrumentalEnhanceNode:
         
         audio_data = audio_data.T
         
-        # 伴奏处理链
+        # 伴奏处理链（Pro版 - 参考audio_enhancer_pro.py）
         board = Pedalboard([
-            # 去除极低频噪音
+            # 【第1步：清理低频】
+            # 去除极低频噪音（保留更多低音能量）
             HighpassFilter(cutoff_frequency_hz=30.0),
             
-            # 增强低音（60-150Hz）- 让鼓和贝斯更有力量
+            # 【第2步：低频处理 - 伴奏力量感】
+            # 增强低音（60-150Hz）- 让鼓和贝斯更有力量（可调）
             LowShelfFilter(cutoff_frequency_hz=100.0, gain_db=bass_boost, q=0.7),
             
+            # ⭐ Pro新增：清理中低频泥泞
+            PeakFilter(cutoff_frequency_hz=300.0, gain_db=-2.0, q=1.0),
+            
+            # 【第3步：中频处理 - 伴奏饱满度】⭐ Pro改进
             # 增强低中频（200-400Hz）- 让乐器更饱满
-            PeakFilter(cutoff_frequency_hz=300.0, gain_db=1.5, q=1.0),
+            PeakFilter(cutoff_frequency_hz=350.0, gain_db=2.0, q=1.0),
             
+            # ⭐ Pro新增：中频清理（500-800Hz）- 减少浑浊
+            PeakFilter(cutoff_frequency_hz=650.0, gain_db=-1.5, q=1.5),
+            
+            # 【第4步：清晰度提升 - 乐器分离】⭐ Pro改进
             # 清晰中频（1-3kHz）- 让乐器分离度更好
-            PeakFilter(cutoff_frequency_hz=2000.0, gain_db=2.0, q=1.2),
+            PeakFilter(cutoff_frequency_hz=2000.0, gain_db=2.5, q=1.2),
             
-            # 增强高频（6kHz以上）- 增加亮度和空气感
+            # ⭐ Pro新增：中高频细节（3-4kHz）- 增加乐器质感
+            PeakFilter(cutoff_frequency_hz=3500.0, gain_db=1.5, q=1.8),
+            
+            # 【第5步：高频处理 - 伴奏亮度】
+            # 临场感（4-6kHz）- 增加乐器临场感
+            PeakFilter(cutoff_frequency_hz=5000.0, gain_db=2.0, q=2.0),
+            
+            # 增强高频（6kHz以上）- 增加亮度和空气感（可调）
             HighShelfFilter(cutoff_frequency_hz=6000.0, gain_db=treble_boost, q=0.7),
             
-            # 轻压缩（保持动态范围）
+            # 【第6步：动态控制 - Pro版双压缩器】⭐⭐⭐
+            # 第一级：伴奏粗压缩（处理大动态）
             Compressor(
-                threshold_db=-22.0,
-                ratio=2.5,           # 较轻压缩，保留伴奏动态
+                threshold_db=-24.0,  # 较低阈值，让更多内容被压缩
+                ratio=2.8,           # 中等压缩比
+                attack_ms=15.0,      # 稍慢启动，保留transient
+                release_ms=150.0     # 慢释放，更平滑
+            ),
+            
+            # 第二级：伴奏精细压缩（平滑过渡）
+            Compressor(
+                threshold_db=-18.0,  # 只处理中高音量
+                ratio=2.0,           # 温和压缩，保留动态
                 attack_ms=15.0,
                 release_ms=150.0
             ),
+            
+            # 【第7步：限幅保护】
+            Limiter(threshold_db=-1.0),
         ])
         
         processed_audio = board(audio_data, sample_rate)
         
-        # 音量归一化
-        meter = pyln.Meter(sample_rate)
-        try:
-            loudness = meter.integrated_loudness(processed_audio)
-            processed_audio = pyln.normalize.loudness(
-                processed_audio, loudness, target_loudness
-            )
-        except Exception as e:
-            print(f"警告：音量归一化失败 - {e}")
-            peak = np.abs(processed_audio).max()
-            if peak > 0:
-                processed_audio = processed_audio * (0.95 / peak)
-        
+        # 不进行响度归一化，只做安全限幅
         processed_audio = np.clip(processed_audio, -1.0, 1.0)
         
         processed_tensor = torch.from_numpy(processed_audio.T).unsqueeze(0)
@@ -691,6 +861,7 @@ class AudioMixerNode:
 NODE_CLASS_MAPPINGS = {
     "AudioNormalizeNode": AudioNormalizeNode,
     "AudioProcessNode": AudioProcessNode,
+    "AudioProcessProNode": AudioProcessProNode,
     "VocalEnhanceNode": VocalEnhanceNode,
     "InstrumentalEnhanceNode": InstrumentalEnhanceNode,
     "LoudnessNormalizeNode": LoudnessNormalizeNode,
@@ -699,7 +870,8 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "AudioNormalizeNode": "Audio Normalize & Save (处理+保存)",
-    "AudioProcessNode": "Audio Process (仅处理)",
+    "AudioProcessNode": "Audio Process (标准处理)",
+    "AudioProcessProNode": "Audio Process Pro (专业处理)",
     "VocalEnhanceNode": "Vocal Enhance (人声增强)",
     "InstrumentalEnhanceNode": "Instrumental Enhance (伴奏增强)",
     "LoudnessNormalizeNode": "Loudness Normalize (响度归一化)",
