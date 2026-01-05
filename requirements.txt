@@ -1,0 +1,4 @@
+pedalboard>=0.7.0
+pyloudnorm>=0.1.0
+numpy
+torch

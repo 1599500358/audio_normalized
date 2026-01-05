@@ -1,0 +1,27 @@
+[project]
+name = "comfyui-audio-normalized"
+version = "1.0.0"
+description = "ComfyUI自定义音频处理节点，支持去浑浊、提亮、压缩和音量归一化"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+keywords = ["comfyui", "audio", "normalization", "lufs", "pedalboard"]
+
+dependencies = [
+    "pedalboard>=0.7.0",
+    "pyloudnorm>=0.1.0",
+    "numpy",
+    "torch",
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_USERNAME/audio_normalized"
+Repository = "https://github.com/YOUR_USERNAME/audio_normalized"
+Issues = "https://github.com/YOUR_USERNAME/audio_normalized/issues"
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
