@@ -255,8 +255,8 @@ class AudioProcessNode:
 
 class AudioProcessProNode:
     """
-    ComfyUI音频处理节点 - Pro版（仅处理不保存）
-    功能：ACE-Step Pro级处理 - 更精细的EQ + 双压缩器串联
+    ComfyUI音频处理节点 - Pro V2版（仅处理不保存）
+    功能：ACE-Step Pro V2级处理 - 稳定优先 + 去嗡嗡声 + 可选饱和度
     """
     
     @classmethod
@@ -271,6 +271,16 @@ class AudioProcessProNode:
                     "step": 0.5,
                     "display": "number"
                 }),
+                "hum_removal": (["None", "50Hz", "60Hz"], {
+                    "default": "None"
+                }),
+                "saturation_drive": ("FLOAT", {
+                    "default": 0.0,
+                    "min": 0.0,
+                    "max": 10.0,
+                    "step": 0.5,
+                    "display": "slider"
+                }),
             },
         }
     
@@ -279,9 +289,9 @@ class AudioProcessProNode:
     FUNCTION = "process_audio"
     CATEGORY = "audio/processing"
     
-    def process_audio(self, audio, target_loudness=-14.0):
+    def process_audio(self, audio, target_loudness=-14.0, hum_removal="None", saturation_drive=0.0):
         """
-        处理音频：ACE-Step Pro专业混音级处理 - 8频段EQ + 双压缩器
+        处理音频：ACE-Step Pro V2专业混音级处理 - 稳定优先版
         """
         # 获取音频数据
         waveform = audio["waveform"]  # shape: [batch, channels, samples]
@@ -296,63 +306,83 @@ class AudioProcessProNode:
         # 转置为 [samples, channels] 格式（pedalboard需要）
         audio_data = audio_data.T
         
-        # 创建音频处理链（ACE-Step Pro专业混音级处理）
-        board = Pedalboard([
-            # 【第1步：清理低频浑浊】
-            # 高通滤波器 - 切除120Hz以下低频
-            HighpassFilter(cutoff_frequency_hz=120.0),
+        # 创建Pre-Chain处理链（ACE-Step Pro V2 - 稳定优先版）
+        pre_board = Pedalboard([
+            # 【第1步：清理低频】V2更保守
+            # 高通滤波器 - 40Hz（V2: 保留更多低频，原版120Hz）
+            HighpassFilter(cutoff_frequency_hz=40.0),
             
-            # 低频搁架 - 削减200Hz以下
-            LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-2.0),
-            
-            # 【第2步：中频清晰度处理 - Pro版8频段】
-            # 削减中低频泥泞（300Hz）
-            PeakFilter(cutoff_frequency_hz=300.0, gain_db=-3.0, q=1.0),
-            
-            # ⭐ Pro新增：中频清理（600Hz）- 去除中频浑浊
-            PeakFilter(cutoff_frequency_hz=600.0, gain_db=-1.5, q=1.5),
-            
-            # 提升中高频清晰度（2500Hz）
-            PeakFilter(cutoff_frequency_hz=2500.0, gain_db=2.5, q=1.5),
-            
-            # ⭐ Pro新增：中高频细节（3500Hz）- 增强咬字和细节
-            PeakFilter(cutoff_frequency_hz=3500.0, gain_db=2.0, q=2.0),
-            
-            # 【第3步：高频清亮处理】
-            # 临场感提升（5000Hz）
-            PeakFilter(cutoff_frequency_hz=5000.0, gain_db=3.0, q=2.0),
-            
-            # 高频搁架（8000Hz）- 空气感
-            HighShelfFilter(cutoff_frequency_hz=8000.0, gain_db=2.0),
-            
-            # 【第4步：动态控制 - Pro版双压缩器串联】⭐⭐⭐
-            # 第一级：粗压缩（处理大动态）
-            Compressor(
-                threshold_db=-22.0,  # 比标准版更激进
-                ratio=3.0,
-                attack_ms=10.0,
-                release_ms=100.0
-            ),
-            
-            # 第二级：精细压缩（平滑过渡）
-            Compressor(
-                threshold_db=-18.0,  # 只处理中高音量
-                ratio=2.0,           # 更温和的压缩
-                attack_ms=10.0,
-                release_ms=100.0
-            ),
-            
-            # 【第5步：限幅保护】防止爆音
-            Limiter(threshold_db=-1.0),
+            # 低频搁架 - 200Hz -1dB（V2: 更温和，原版-2dB）
+            LowShelfFilter(cutoff_frequency_hz=200.0, gain_db=-1.0),
         ])
         
-        # 应用效果处理
-        processed_audio = board(audio_data, sample_rate)
+        # 【可选：去嗡嗡声处理】V2新增功能
+        if hum_removal != "None":
+            hum_freq = 50.0 if hum_removal == "50Hz" else 60.0
+            # 去除基频及谐波（60/120/180Hz或50/100/150Hz）
+            for k in range(1, 4):  # 3个谐波
+                pre_board.append(
+                    PeakFilter(
+                        cutoff_frequency_hz=hum_freq * k,
+                        gain_db=-12.0,
+                        q=30.0  # 窄带陷波
+                    )
+                )
+        
+        # 【第2步：中频清晰度处理】V2简化版（5频段 vs 原版8频段）
+        pre_board.extend([
+            # 削减中低频泥泞（300Hz）V2: -2dB（原版-3dB）
+            PeakFilter(cutoff_frequency_hz=300.0, gain_db=-2.0, q=0.9),
+            
+            # V2移除了600Hz中频清理（简化）
+            
+            # 提升清晰度（3200Hz）V2: +1dB（原版2500Hz +2.5dB）
+            PeakFilter(cutoff_frequency_hz=3200.0, gain_db=1.0, q=0.9),
+            
+            # V2移除了3500Hz细节提升（简化）
+        ])
+        
+        # 【第3步：高频清亮处理】V2更温和
+        pre_board.extend([
+            # V2移除了5000Hz临场感提升（简化）
+            
+            # 高频搁架（10000Hz）V2: +1dB（原版8000Hz +2dB）
+            HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=1.0),
+        ])
+        
+        # 【第4步：动态控制 - V2更温和的双压缩器】
+        pre_board.extend([
+            # 第一级：粗压缩（V2更温和）
+            Compressor(
+                threshold_db=-22.0,
+                ratio=2.5,           # V2: 2.5（原版3.0）
+                attack_ms=20.0,      # V2: 20ms（原版10ms）更慢，保留瞬态
+                release_ms=160.0     # V2: 160ms（原版100ms）更平滑
+            ),
+            
+            # 第二级：精细压缩（V2更温和）
+            Compressor(
+                threshold_db=-18.0,
+                ratio=1.8,           # V2: 1.8（原版2.0）
+                attack_ms=12.0,      # V2: 12ms（原版10ms）
+                release_ms=120.0     # V2: 120ms（原版100ms）
+            ),
+        ])
+        
+        # 应用Pre-Chain效果处理
+        processed_audio = pre_board(audio_data, sample_rate)
+        
+        # 【可选：Saturation饱和度处理】V2新增功能
+        if saturation_drive > 0:
+            # 使用tanh软饱和（温和的谐波增强）
+            drive = 10 ** (saturation_drive / 20.0)
+            denom = np.tanh(drive)
+            if denom > 0:
+                processed_audio = np.tanh(processed_audio * drive) / denom
         
         # 音量归一化到目标LUFS
         meter = pyln.Meter(sample_rate)
         
-        # 测量当前响度
         try:
             loudness = meter.integrated_loudness(processed_audio)
             # 归一化到目标响度
@@ -363,10 +393,16 @@ class AudioProcessProNode:
             )
         except Exception as e:
             print(f"警告：音量归一化失败 - {e}，使用峰值归一化")
-            # 如果LUFS归一化失败，使用峰值归一化
             peak = np.abs(processed_audio).max()
             if peak > 0:
                 processed_audio = processed_audio * (0.95 / peak)
+        
+        # 【第5步：Post-Chain - V2关键差异】
+        # Limiter在LUFS归一化之后（原版在之前）
+        post_board = Pedalboard([
+            Limiter(threshold_db=-1.0),
+        ])
+        processed_audio = post_board(processed_audio, sample_rate)
         
         # 确保不超过[-1, 1]范围
         processed_audio = np.clip(processed_audio, -1.0, 1.0)
