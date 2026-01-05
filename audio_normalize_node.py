@@ -37,6 +37,7 @@ class AudioNormalizeNode:
     RETURN_NAMES = ("audio", "file_path")
     FUNCTION = "process_audio"
     CATEGORY = "audio/processing"
+    OUTPUT_NODE = True
     
     def process_audio(self, audio, output_format="wav", target_loudness=-14.0):
         """
@@ -123,7 +124,18 @@ class AudioNormalizeNode:
             "sample_rate": sample_rate
         }
         
-        return (output_audio, filepath)
+        # 返回结果，包含音频播放器UI
+        return {
+            "ui": {
+                "audio": [{
+                    "filename": filename,
+                    "subfolder": "",
+                    "type": "output",
+                    "format": f"audio/{output_format}"
+                }]
+            },
+            "result": (output_audio, filepath)
+        }
 
 
 # ComfyUI节点注册
